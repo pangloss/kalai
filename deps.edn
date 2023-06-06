@@ -5,7 +5,9 @@
         org.clojure/tools.cli               {:mvn/version "1.0.194"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.2"}
         meander/epsilon                     {:mvn/version "0.0.512"}
-        mvxcvi/puget                        {:mvn/version "1.3.1"}}
+        mvxcvi/puget                        {:mvn/version "1.3.1"}
+        pangloss/pattern {:git/url "https://github.com/pangloss/pattern"
+                          :git/sha "186fad61cb40fc1f32c128a2b2d4eb06fe11066f"}}
  :paths ["src" "resources"]
 
  :aliases {:test {:extra-paths ["test"]
