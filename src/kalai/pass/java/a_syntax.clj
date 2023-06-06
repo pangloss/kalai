@@ -1,7 +1,6 @@
 (ns kalai.pass.java.a-syntax
   (:require [kalai.util :as u]
-            [meander.strategy.epsilon :as s]
-            [meander.epsilon :as m]))
+            [pattern :refer [directed rule-list rule sub subm descend descend-all success]]))
 
 ;;; -------- language constructs to syntax
 ;; expanded s-expressions below
@@ -48,267 +47,230 @@
 ;;
 
 
+(defn get-t [x]
+  (:t (meta x)))
+
 (declare statement)
 
-;; half Clojure half Java
 (def expression
-  (s/rewrite
-    ;; Data Literals
+  (directed
+    (rule-list
+      (rule create-empty-collection
+        '(& (| [] {} #{}) ?this)
+        (sub (j/new ~(:t (meta this)))))
 
-    ;;;; empty collections don't need a tmp variable (with new local block, etc.)
-    (m/and (m/or [] {} #{})
-           (m/pred empty?)
-           (m/app (comp :t meta) ?t))
-    ;;->
-    (j/new ?t)
+      ;; mutable vector ^{:t {:mvector [_]}} []
+      (rule mutable-vector
+        '(& (?:chain (? expr vector?) get-t (? t #{:mvector}))
+           [??->x*])
+        (let [tmp (u/tmp t expr)
+              exprs (for [x x*]
+                      (sub (j/expression-statement (j/method add ?tmp ?x))))]
+          (sub (group (j/init ?tmp (j/new ?t)) ??exprs ?tmp))))
 
-    ;;;; vector []
+      ;; persistent vector ^{:t {:vector [_]}} []
+      ;; or any other type on a vector literal
+      (rule persistent-vector
+        '(& (? expr vector?) [??->x*])
+        (let [t (get-t expr)
+              t (if (= t :any) {:vector [:any]} t)]
+          (u/preserve-type expr
+            (reduce (fn [form x] (sub (j/method addLast ?form ?x)))
+              (sub (j/new ?t))
+              x*))))
 
-    ;; mutable vector ^{:t {:mvector [_]}} []
-    (m/and [!x ...]
-           ?expr
-           (m/app (comp :t meta) (m/and ?t
-                                        (m/pred :mvector)))
-           (m/let [?tmp (u/tmp ?t ?expr)]))
-    ;;->
-    (group
-      (j/init ?tmp (j/new ?t))
-      . (j/expression-statement (j/method add ?tmp (m/app expression !x))) ...
-      ?tmp)
-
-    ;; persistent vector ^{:t {:vector [_]}} []
-    ;; or any other type on a vector literal
-    (m/and [!x ...]
-           ?expr
-           (m/app (comp :t meta) (m/and ?t)))
-    ;;->
-    (m/app
-      #(u/preserve-type ?expr %)
-      (m/app u/thread-second
-             (j/new ~(if (= ?t :any)
-                       {:vector [:any]}
-                       ?t))
-             . (j/method addLast
-                         (m/app expression !x)) ...))
-
-    ;;;; map {}
-
-    ;; mutable map ^{:t {:mmap [_]}} {}
-    (m/and {}
-           ?expr
-           (m/app u/sort-any-type ([!k !v] ...))
-           (m/app (comp :t meta) (m/and ?t
-                                        (m/pred :mmap)))
-           (m/let [?tmp (u/tmp ?t ?expr)]))
-    ;;->
-    (group
-      (j/init ?tmp (j/new ?t))
-      . (j/expression-statement (j/method put ?tmp
-                                          (m/app expression !k)
-                                          (m/app expression !v))) ...
-      ?tmp)
-
-    ;; persistent map ^{:t {:map [_]}} {}
-    ;; or any other type on a map literal
-    (m/and {}
-           ?expr
-           (m/app u/sort-any-type ([!k !v] ...))
-           (m/app (comp :t meta) (m/and ?t)))
-    ;;->
-    (m/app
-      #(u/preserve-type ?expr %)
-      (m/app u/thread-second
-             (j/new ~(if (= ?t :any)
-                       {:map [:any :any]}
-                       ?t))
-             . (j/method put
-                         (m/app expression !k)
-                         (m/app expression !v)
-                         io.lacuna.bifurcan.Maps.MERGE_LAST_WRITE_WINS) ...))
+      ;; mutable map ^{:t {:mmap [_]}} {}
+      (rule mutable-map
+        '(?:chain (? expr map?) get-t (? t #{:mmap}))
+        (let [kvs (map (fn [[k v]] [(descend k) (descend v)]) (u/sort-any-type expr))
+              tmp (u/tmp t expr)
+              exprs (map (fn [[k v]] (sub (j/expression-statement (j/method put ?tmp ?k ?v)))) kvs)]
+          (sub (group (j/init ?tmp (j/new ?t)) ??exprs ?tmp))))
 
 
-    ;;;; set #{}
+      ;; persistent map ^{:t {:map [_]}} {}
+      ;; or any other type on a map literal
+      (rule persistent-map
+        '(? expr map?)
+        (let [t (get-t expr)
+              t (if (= t :any) {:map [:any :any]} t)]
+          (u/preserve-type expr
+            (reduce (fn [form [k v]]
+                      (let [k (descend k)
+                            v (descend v)]
+                        (sub (j/method put ?form ?k ?v
+                               io.lacuna.bifurcan.Maps.MERGE_LAST_WRITE_WINS))))
+              (sub (j/new ?t))
+              (u/sort-any-type expr)))))
 
-    ;; mutable set ^{:t {:mset [_]}} #{}
-    (m/and #{}
-           ?expr
-           (m/app u/sort-any-type (!k ...))
-           (m/app (comp :t meta) (m/and ?t
-                                        (m/pred :mset)))
-           (m/let [?tmp (u/tmp ?t ?expr)]))
-    ;;->
-    (group
-      (j/init ?tmp (j/new ?t))
-      . (j/expression-statement (j/method add ?tmp (m/app expression !k))) ...
-      ?tmp)
+      (rule mutable-set
+        '(?:chain (? expr set?) get-t (? t #{:mset}))
+        (let [x* (descend-all (u/sort-any-type expr))
+              tmp (u/tmp t expr)
+              exprs (for [x x*]
+                      (sub (j/expression-statement (j/method add ?tmp ?x))))]
+          (sub (group (j/init ?tmp (j/new ?t)) ??exprs ?tmp))))
 
-    ;; persistent set ^{:t {:set [_]}} #{}
-    ;; or any other type on a set literal
-    (m/and #{}
-           ?expr
-           (m/app u/sort-any-type (!k ...))
-           (m/app (comp :t meta) (m/and ?t)))
-    ;;->
-    (m/app
-      #(u/preserve-type ?expr %)
-      (m/app u/thread-second
-             (j/new ~(if (= ?t :any)
-                       {:set [:any]}
-                       ?t))
-             . (j/method add
-                         (m/app expression !k)) ...))
+      (rule persistent-set
+        '(? expr set?)
+        (let [x* (descend-all (u/sort-any-type expr))
+              t (get-t expr)
+              t (if (= t :any) {:set [:any]} t)]
+          (u/preserve-type expr
+            (reduce (fn [form x] (sub (j/method add ?form ?x)))
+              (sub (j/new ?t))
+              x*))))
 
+      (rule interop
+        '(new ?c ??->args)
+        (sub (j/new ?c ??args)))
 
-    ;; Interop
-    (new ?c . !args ...)
-    (j/new ?c . (m/app expression !args) ...)
+      (rule operator-usage
+        '(operator ?op ??->args)
+        (sub (j/operator ?op ??args)))
 
-    ;; operator usage
-    (operator ?op . !args ...)
-    (j/operator ?op . (m/app expression !args) ...)
+      (rule function-invocation
+        '(invoke ?f ??->args)
+        (subm (j/invoke ?f ??args)))
 
-    ;; function invocation
-    (m/and (invoke ?f . !args ...)
-           (m/app meta ?meta))
-    (m/app with-meta
-           (j/invoke ?f . (m/app expression !args) ...)
-           ?meta)
+      (rule method-invocation
+        '(method ?method ?->object ??->args)
+        (sub (j/method ?method ?object ??args)))
 
-    (method ?method ?object . !args ...)
-    (j/method ?method (m/app expression ?object) . (m/app expression !args) ...)
+      (rule lambda-function
+        '(lambda ?name ?docstring ?body)
+        (sub (j/lambda ?name ?docstring ?body)))
 
-    ;; TODO: lambda function
-    (lambda ?name ?docstring ?body)
-    (j/lambda ?name ?docstring ?body)
+      (rule if1
+        '(if ?->condition ?then)
+        (let [tmp (u/tmp-for then)]
+          (sub (group
+                 (j/init ~(u/maybe-meta-assoc tmp :mut true))
+                 (j/if ?condition
+                   (j/block (j/assign ?tmp ~(descend then))))
+                 ?tmp))))
 
-    ;; conditionals as an expression must be ternaries, but ternaries cannot contain bodies
-    ;;(if ?condition ?then)
-    ;;(j/ternary (m/app expression ?condition) (m/app expression ?then) nil)
+      (rule if2
+        '(if ?->condition ?then ?->else)
+        (let [tmp (u/tmp-for then)]
+          (sub (group
+                 (j/init ~(u/maybe-meta-assoc tmp :mut true))
+                 (j/if ?condition
+                   (j/block (j/assign ?tmp ~(descend then)))
+                   (j/block (j/assign ?tmp ?else)))
+                 ?tmp))))
 
-    ;;(if ?condition ?then ?else)
-    ;;(j/ternary (m/app expression ?condition) (m/app expression ?then) (m/app expression ?else))
+      (rule do-block
+        '(do ??x ?->last)
+        (let [x (map statement x)]
+          (sub (group ??x ?last))))
 
-    ;; when a conditional appears as an expression, we need a tmp variable,
-    ;; so we create a group.
-    (m/and (if ?condition ?then)
-           (m/let [?tmp (u/tmp-for ?then)]))
-    (group
-      (j/init (m/app u/maybe-meta-assoc ?tmp :mut true))
-      (j/if (m/app expression ?condition)
-        (j/block (j/assign ?tmp (m/app expression ?then))))
-      ?tmp)
-
-    (m/and (if ?condition ?then ?else)
-           (m/let [?tmp (u/tmp-for ?then)]))
-    (group
-      (j/init (m/app u/maybe-meta-assoc ?tmp :mut true))
-      (j/if (m/app expression ?condition)
-        (j/block (j/assign ?tmp (m/app expression ?then)))
-        (j/block (j/assign ?tmp (m/app expression ?else))))
-      ?tmp)
-
-    ;; faithfully reproduce Clojure semantics for do as a collection of
-    ;; side-effect statements and a return expression
-    (do . !x ... ?last)
-    (group
-      . (m/app statement !x) ...
-      (m/app expression ?last))
-
-    ;; let
-
-    ;; TODO: how to do this? maybe through variable assignment?
-    (case ?x {& (m/seqable [!k [_ !v]] ...)})
-    (j/switch (m/app expression ?x)
-              (j/block . (j/case !k (j/expression-statement (m/app expression !v))) ...))
-
-    ?else
-    ?else))
+      (rule case
+        '(case ?->x (?:* ?k ?->v))
+        (sub (j/switch ?x
+               (j/block (?:* ?k (j/expression-statement ?v)))))))))
 
 (def init
-  (s/rewrite
-    (init ?name)
-    (j/init ?name)
+  (rule-list
+    (rule '(init ?name)
+      (sub (j/init ?name)))
 
-    (init ?name ?x)
-    (j/init ?name (m/app expression ?x))))
+    (rule '(init ?name ?x)
+      (sub (j/init ?name ~(expression x))))))
 
 (def top-level-init
-  (s/rewrite
-    (init ?name)
-    (j/init (m/app u/maybe-meta-assoc ?name :global true))
+  (rule-list
+    (rule '(init ?name)
+      (sub (j/init ~(u/maybe-meta-assoc name :global true))))
 
-    (init ?name ?x)
-    (j/init (m/app u/maybe-meta-assoc ?name :global true) (m/app expression ?x))))
+    (rule '(init ?name ?x)
+      (sub (j/init ~(u/maybe-meta-assoc name :global true) ~(expression x))))))
 
 (def statement
-  (s/choice
-    init
-    (s/rewrite
-      (return ?x)
-      (j/expression-statement (j/return (m/app expression ?x)))
+  (directed
+    {:fn-map {'>> expression}}
+    (rule-list
+      init
 
-      (while ?condition . !body ...)
-      (j/while (m/app expression ?condition)
-               (j/block . (m/app statement !body) ...))
+      (rule return
+        '(return ?>>x)
+        (sub (j/expression-statement (j/return ?x))))
 
-      (foreach ?sym ?xs . !body ...)
-      (j/foreach ?sym (m/app expression ?xs)
-                 (j/block . (m/app statement !body) ...))
+      (rule 'while
+        '(while ?>>condition ??->body)
+        (sub
+          (j/while ?condition
+            (j/block ??body))))
 
-      ;; conditional
-      (if ?test ?then)
-      (j/if (m/app expression ?test)
-        (j/block (m/app statement ?then)))
+      (rule 'foreach
+        '(foreach ?sym ?>>xs ??->body)
+        (sub (j/foreach ?sym ?xs
+               (j/block ??body))))
 
-      (if ?test ?then ?else)
-      (j/if (m/app expression ?test)
-        (j/block (m/app statement ?then))
-        (j/block (m/app statement ?else)))
+      (rule conditional1
+        '(if ?>>test ?->then)
+        (sub (j/if ?test
+               (j/block ?then))))
 
-      (case ?x {& (m/seqable [!k [_ !v]] ...)} ?default)
-      (j/switch (m/app expression ?x)
-                (j/block . (j/case !k (j/expression-statement (m/app expression !v))) ...
-                         (j/default ?default)))
+      (rule conditional2
+        '(if ?>>test ?->then ?->else)
+        (sub (j/if ?test
+               (j/block ?then)
+               (j/block ?else))))
 
-      (do . !xs ...)
-      (j/block . (m/app statement !xs) ...)
+      (rule case
+        '(case ?>>x (?:* ?k ?>>v) ?default)
+        (sub (j/switch ?x
+               (j/block (?:* (j/case ?k (j/expression-statement ?v)))
+                 (j/default ?default)))))
 
-      (assign ?name ?value)
-      (j/assign ?name (m/app expression ?value))
+      (rule do
+        '(do ??->xs)
+        (sub (j/block ??xs)))
 
-      (m/and
-        (m/or
-          (assign & _)
-          (operator ++ _)
-          (operator -- _)
-          (method & _)
-          (invoke & _)
-          (new & _))
-        ?expr)
-      (j/expression-statement (m/app expression ?expr))
+      (rule assign
+        '(assign ?name ?>>value)
+        (sub (j/assign ?name ?value)))
+
+      (rule other-expr
+        '(& (|
+              (assign ??_)
+              (operator ++ ?_)
+              (operator -- ?_)
+              (method ??_)
+              (invoke ??_)
+              (new ??_))
+           ?>>expr)
+        (sub (j/expression-statement ?expr)))
 
       ;; Java does not allow other expressions as statements
-      ?else
-      nil)))
+      (rule otherwise
+        '?else
+        (success nil)))))
+
 
 (def function
-  (s/rewrite
-    ;; function definition
-    (function ?name ?params . !body ...)
-    (j/function ?name ?params
-                (j/block . (m/app statement !body) ...))))
+  (rule function
+    '(function ?name ?params ??body)
+    (let [body (map statement body)]
+      (sub (j/function ?name ?params (j/block ??body))))))
 
 (def top-level-form
-  (s/choice
+  (rule-list
     function
     top-level-init
-    (s/rewrite
-      ?else ~(throw (ex-info "Expected a top level form" {:else ?else})))))
+    (rule otherwise
+      '?else
+      (throw (ex-info "Expected a top level form" {:else else})))))
 
 (def rewrite
-  (s/rewrite
-    (namespace ?ns-name . !forms ...)
-    (j/class ?ns-name
-             (j/block . (m/app top-level-form !forms) ...))
+  (rule-list
+    (rule
+      '(namespace ?ns-name ??forms)
+      (let [forms (map top-level-form forms)]
+        (sub (j/class ?ns-name
+               (j/block ??forms)))))
 
-    ?else ~(throw (ex-info "Expected a namespace" {:else ?else}))))
+    (rule otherwise
+      '?else
+      (throw (ex-info "Expected a namespace" {:else else})))))
